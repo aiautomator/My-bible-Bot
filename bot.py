@@ -1,294 +1,372 @@
-import re
-import urllib.parse
-import requests
-from uuid import uuid4
-from bs4 import BeautifulSoup
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    InlineQueryHandler,
-    filters,
-    ContextTypes,
-)
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import re
+import time
+import urllib.parse
+from threading import Thread
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Reads token from cloud settings, or falls back to your local token
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+# ==========================================
+# 1. CONFIGURATION & INITIALIZATION
+# ==========================================
+# Replace with your actual BotFather token or set it in Render Environment Variables
+BOT_TOKEN  = "8825313159:AAFfZDCqJ79dyEg9dhok8c5s-WuJIHARUKc"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# Supported Bible Translations (Code -> Full Name)
-TRANSLATIONS = {
-    "KJV": "King James Version",
-    "NIV": "New International Version",
-    "NLT": "New Living Translation",
-    "ESV": "English Standard Version",
-    "NKJV": "New King James Version",
-    "AMP": "Amplified Bible",
-    "MSG": "The Message",
-    "TPT": "The Passion Translation",
+SUPPORTED_VERSIONS = ["KJV", "NKJV", "NIV", "NLT", "ESV", "AMP", "MSG", "TPT"]
+
+# In-memory storage for user sessions, active passages, and search pagination
+user_state = {}
+user_search_results = {}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Remembers each user's active Bible translation
-user_translations = {}
+# ==========================================
+# 2. RENDER KEEP-ALIVE WEB SERVER
+# ==========================================
+app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "Bible Bot is alive and running!"
 
-def parse_reference_details(ref_str: str):
-    """Extracts Book, Chapter, First Verse, and Last Verse for Prev/Next navigation"""
-    match = re.match(r"^(\d?\s*[A-Za-z\s]+?)\s+(\d+)(?::(\d+)(?:-(\d+))?)?$", ref_str.strip())
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+def keep_alive():
+    server_thread = Thread(target=run_web_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+# ==========================================
+# 3. USER ACTIVITY LOGGING
+# ==========================================
+def log_activity(user, action):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    username = f"@{user.username}" if user.username else "NoUsername"
+    log_entry = f"[{timestamp}] ID: {user.id} | Name: {user.first_name} ({username}) | Action: {action}"
+    print(log_entry)
+    try:
+        with open("user_activity.log", "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+    except Exception as e:
+        print(f"Log Error: {e}")
+
+# ==========================================
+# 4. BEAUTIFULSOUP SCRAPING FUNCTIONS
+# ==========================================
+def fetch_passage(reference, version="KJV"):
+    encoded_ref = urllib.parse.quote_plus(reference)
+    url = f"https://www.biblegateway.com/passage/?search={encoded_ref}&version={version}"
+
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=12)
+        if response.status_code != 200:
+            return None, None
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        passage_box = soup.find("div", class_="passage-text")
+        if not passage_box:
+            return None, None
+
+        # Extract clean heading title
+        heading_tag = soup.find("div", class_="dropdown-display-text")
+        clean_title = heading_tag.get_text(strip=True) if heading_tag else reference.title()
+
+        # Remove footnotes, cross-references, and chapter numbers that clutter output
+        for unwanted in passage_box.find_all(["sup", "div", "h1", "h2", "h3", "h4"], class_=["footnote", "crossreference", "footnotes", "crossrefs", "passage-other-trans"]):
+            unwanted.decompose()
+
+        for sup in passage_box.find_all("sup", class_="versenum"):
+            sup.replace_with(f" [{sup.get_text(strip=True)}] ")
+
+        for chap in passage_box.find_all("span", class_="chapternum"):
+            chap.replace_with("[1] ")
+
+        text_paragraphs = []
+        for p in passage_box.find_all("p"):
+            para_text = p.get_text(" ", strip=True)
+            if para_text:
+                text_paragraphs.append(para_text)
+
+        full_text = "\n\n".join(text_paragraphs)
+        full_text = re.sub(r'\s+', ' ', full_text).replace(" \n\n ", "\n\n")
+
+        if not full_text:
+            return None, None
+
+        return clean_title, full_text[:3800]  # Keep within Telegram's 4096-character limit
+    except Exception as e:
+        print(f"Passage Scraping Error: {e}")
+        return None, None
+
+def search_bible_word(query, version="KJV"):
+    encoded_query = urllib.parse.quote_plus(query)
+    url = f"https://www.biblegateway.com/quicksearch/?quicksearch={encoded_query}&version={version}&searchtype=keyword"
+
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=12)
+        if response.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        results = []
+        passage_links = soup.find_all("a", href=lambda href: href and "/passage/?search=" in href)
+
+        seen_refs = set()
+        for link in passage_links:
+            reference = link.text.strip()
+            if not reference or reference in seen_refs or "Next" in reference or "Context" in reference or "Full Chapter" in reference:
+                continue
+            seen_refs.add(reference)
+
+            parent = link.find_parent("li") or link.find_parent("div", class_="bible-item") or link.find_parent("div")
+            if parent:
+                raw_snippet = parent.get_text(separator=" ", strip=True)
+                snippet = raw_snippet.replace(reference, "").replace("In Context", "").replace("Full Chapter", "").replace("|", "").strip()
+                results.append(f"📖 *{reference}*\n_{snippet}_")
+
+        return results
+    except Exception as e:
+        print(f"Search Error: {e}")
+        return []
+
+# ==========================================
+# 5. INLINE KEYBOARDS & HELPERS
+# ==========================================
+def adjust_chapter(reference, delta):
+    """Increments or decrements the chapter number for Prev/Next navigation."""
+    match = re.match(r"^([1-3]?\s?[A-Za-z\s]+?)\s+(\d+)(?::.*)?$", reference.strip())
     if match:
         book = match.group(1).strip()
-        chapter = int(match.group(2))
-        first_v = int(match.group(3)) if match.group(3) else 1
-        last_v = int(match.group(4)) if match.group(4) else first_v
-        return book, chapter, first_v, last_v
-    return None, None, None, None
+        chapter = max(1, int(match.group(2)) + delta)
+        return f"{book} {chapter}"
+    return reference
 
+def build_passage_keyboard(current_version):
+    markup = InlineKeyboardMarkup()
 
-def fetch_passage_data(reference: str, translation: str = "NIV"):
-    """Fetches any Bible translation (TPT, MSG, AMP, NIV, NLT, KJV, etc.) from BibleGateway"""
-    translation = translation.upper()
-    encoded_ref = urllib.parse.quote(reference)
-    url = f"https://www.biblegateway.com/passage/?search={encoded_ref}&version={translation}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        passage_div = soup.find("div", class_="passage-text")
-        if not passage_div:
-            return None
-
-        # Get official Reference Title (e.g. "John 3:16" or "Psalm 23")
-        bcv = soup.find("div", class_="dropdown-display-text")
-        clean_ref = bcv.get_text(strip=True) if bcv else reference.title()
-
-        # Remove footnotes, cross-references, and section headings so text is clean
-        for junk in passage_div.select(".footnotes, .crossrefs, .passage-other-trans, .full-chap-link, h3, h4, sup.footnote, sup.crossreference"):
-            junk.decompose()
-
-        # Format verse numbers cleanly like [16]
-        for vnum in passage_div.find_all("sup", class_="versenum"):
-            num_text = vnum.get_text(strip=True)
-            vnum.replace_with(f" [{num_text}] ")
-
-        for cnum in passage_div.find_all("span", class_="chapternum"):
-            cnum.replace_with("[1] ")
-
-        paragraphs = []
-        for p in passage_div.find_all("p"):
-            text = " ".join(p.get_text().split())
-            if text:
-                paragraphs.append(text)
-
-        full_text = "\n\n".join(paragraphs)
-        if not full_text:
-            return None
-
-        # Keep inside Telegram's 4096-character limit
-        if len(full_text) > 3700:
-            full_text = full_text[:3700] + "...\n\n*(Passage truncated for length)*"
-
-        trans_full = TRANSLATIONS.get(translation, translation)
-        message_text = f"📖 *{clean_ref} ({translation})*\n_{trans_full}_\n\n{full_text}"
-
-        book, chapter, first_v, last_v = parse_reference_details(clean_ref)
-
-        return {
-            "text": message_text,
-            "book": book,
-            "chapter": chapter,
-            "first_verse": first_v,
-            "last_verse": last_v,
-            "reference": clean_ref,
-            "translation": translation,
-        }
-    except Exception:
-        return None
-
-
-def build_action_keyboard(info: dict) -> InlineKeyboardMarkup:
-    """Builds Navigation row + 2 rows of Translation buttons (including TPT, MSG, AMP)"""
-    book = info["book"]
-    chapter = info["chapter"]
-    first_v = info["first_verse"]
-    last_v = info["last_verse"]
-    trans = info["translation"].upper()
-    ref = info["reference"]
-
-    keyboard = []
-
-    # Row 1: Prev | Chapter | Next (if Book & Chapter were parsed)
-    if book and chapter:
-        nav_row = []
-        if first_v and first_v > 1:
-            prev_ref = f"{book} {chapter}:{first_v - 1}"
-            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"v|{prev_ref}|{trans}"))
-
-        chapter_ref = f"{book} {chapter}"
-        nav_row.append(InlineKeyboardButton("📖 Chapter", callback_data=f"v|{chapter_ref}|{trans}"))
-
-        if last_v:
-            next_ref = f"{book} {chapter}:{last_v + 1}"
-            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"v|{next_ref}|{trans}"))
-
-        keyboard.append(nav_row)
-
-    # Row 2: Classic & Modern Standard Versions
-    row_a_versions = ["KJV", "NKJV", "NIV", "NLT"]
-    row_a = [
-        InlineKeyboardButton(
-            f"✅ {v}" if v == trans else v,
-            callback_data=f"v|{ref}|{v}"
-        )
-        for v in row_a_versions
-    ]
-    keyboard.append(row_a)
-
-    # Row 3: Expressive & Study Versions (ESV, AMP, MSG, TPT)
-    row_b_versions = ["ESV", "AMP", "MSG", "TPT"]
-    row_b = [
-        InlineKeyboardButton(
-            f"✅ {v}" if v == trans else v,
-            callback_data=f"v|{ref}|{v}"
-        )
-        for v in row_b_versions
-    ]
-    keyboard.append(row_b)
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "👋 *Welcome to Your Multi-Version Bible Bot!*\n\n"
-        "Send any reference like `John 3:16` or `Psalm 23:1-4`.\n"
-        "You can also include a version code at the end, like:\n"
-        "• `John 3:16 TPT`\n"
-        "• `Romans 8:28 MSG`\n"
-        "• `Philippians 4:6-7 AMP`\n\n"
-        "Or tap any of the *8 version buttons* below a verse to switch instantly!"
+    # Row 1: Chapter Navigation
+    markup.row(
+        InlineKeyboardButton("⬅️ Prev Chapter", callback_data="nav_prev"),
+        InlineKeyboardButton("Next Chapter ➡️", callback_data="nav_next")
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
+    # Row 2 & 3: 8 Translation Switchers (4 buttons per row)
+    row1, row2 = [], []
+    for idx, ver in enumerate(SUPPORTED_VERSIONS):
+        label = f"✅ {ver}" if ver == current_version else ver
+        btn = InlineKeyboardButton(label, callback_data=f"ver_{ver}")
+        if idx < 4:
+            row1.append(btn)
+        else:
+            row2.append(btn)
 
-async def handle_verse_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    default_trans = user_translations.get(user_id, "NIV")
+    markup.row(*row1)
+    markup.row(*row2)
+    return markup
 
-    raw_query = " ".join(context.args) if context.args else update.message.text.strip()
-    if not raw_query:
-        await update.message.reply_text("Try sending a verse like `John 3:16 TPT`", parse_mode="Markdown")
+def send_search_page(chat_id, message_id=None):
+    data = user_search_results.get(chat_id)
+    if not data:
         return
 
-    # Check if the user typed a version at the end (e.g., "John 3:16 TPT" or "Psalm 23 MSG")
-    words = raw_query.split()
-    if len(words) > 1 and words[-1].upper() in TRANSLATIONS:
-        translation = words[-1].upper()
-        query = " ".join(words[:-1])
-        user_translations[user_id] = translation
-    else:
-        translation = default_trans
-        query = raw_query
+    page = data["page"]
+    results = data["results"]
+    version = data.get("version", "KJV")
 
-    info = fetch_passage_data(query, translation)
-    if not info:
-        await update.message.reply_text(
-            "❌ Verse not found. Try a format like `John 3:16`, `Rom 8:28 TPT`, or `Psalm 23 MSG`.",
-            parse_mode="Markdown",
+    start = page * 5
+    end = start + 5
+    page_results = results[start:end]
+
+    text = (
+        f"🔍 *Search:* '{data['query']}' ({version})\n"
+        f"*Showing {start + 1} to {min(end, len(results))} of {len(results)} matches*\n\n"
+    )
+    text += "\n\n".join(page_results)
+
+    markup = InlineKeyboardMarkup()
+    nav_buttons = []
+
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev 5", callback_data="search_prev"))
+    if end < len(results):
+        nav_buttons.append(InlineKeyboardButton("Next 5 ➡️", callback_data="search_next"))
+
+    if nav_buttons:
+        markup.row(*nav_buttons)
+
+    if message_id:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
+# ==========================================
+# 6. TELEGRAM BOT HANDLERS (Private Chat Filter)
+# ==========================================
+@bot.message_handler(commands=["start", "help"], chat_types=["private"])
+def handle_start(message):
+    log_activity(message.from_user, "/start")
+    welcome_text = (
+        "🙏 *Welcome to the Multi-Version Bible Bot!*\n\n"
+        "📖 *Read Scriptures:*\n"
+        "Simply type any Bible reference (e.g., `John 3:16`, `Psalm 23`, or `Romans 8:28-31`).\n\n"
+        "🔍 *Keyword & Phrase Search:*\n"
+        "Use `/search <words>` to find verses matching a collection of words!\n"
+        "Example: `/search peace in the storm` or `/search faith hope love`\n\n"
+        "🌐 *Supported Translations:*\n"
+        "`KJV`, `NKJV`, `NIV`, `NLT`, `ESV`, `AMP`, `MSG`, `TPT`"
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+
+@bot.message_handler(commands=["search"], chat_types=["private"])
+def handle_search(message):
+    query = message.text.replace("/search", "", 1).strip()
+    chat_id = message.chat.id
+    log_activity(message.from_user, f"/search {query}")
+
+    if not query:
+        bot.reply_to(
+            message,
+            "Please provide a word or phrase to search!\nExample: `/search faith hope love`",
+            parse_mode="Markdown"
         )
         return
 
-    keyboard = build_action_keyboard(info)
-    await update.message.reply_text(info["text"], parse_mode="Markdown", reply_markup=keyboard)
+    version = user_state.get(chat_id, {}).get("version", "KJV")
+    status_msg = bot.reply_to(message, f"🔍 Searching *{version}* scriptures for *'{query}'*...", parse_mode="Markdown")
 
+    results_list = search_bible_word(query, version=version)
 
-async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-    if len(parts) != 3:
+    if not results_list:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            text=f"❌ No results found for *'{query}'*. Try different keywords.",
+            parse_mode="Markdown"
+        )
         return
 
-    _, ref, trans = parts
-    user_translations[query.from_user.id] = trans
+    user_search_results[chat_id] = {
+        "query": query,
+        "results": results_list,
+        "page": 0,
+        "version": version
+    }
 
-    info = fetch_passage_data(ref, trans)
-    if not info:
-        await query.answer("⚠️ Verse not available in this translation or end of chapter reached.", show_alert=True)
+    send_search_page(chat_id, message_id=status_msg.message_id)
+
+@bot.message_handler(func=lambda m: True, chat_types=["private"])
+def handle_passage_request(message):
+    chat_id = message.chat.id
+    reference = message.text.strip()
+    log_activity(message.from_user, f"Passage: {reference}")
+
+    current_version = user_state.get(chat_id, {}).get("version", "KJV")
+    status_msg = bot.reply_to(message, f"📖 Fetching *{reference}* ({current_version})...", parse_mode="Markdown")
+
+    clean_title, passage_text = fetch_passage(reference, current_version)
+
+    if not passage_text:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            text="❌ Could not find that passage. Check your spelling (e.g., `John 3:16`) or try `/search <words>`.",
+            parse_mode="Markdown"
+        )
         return
 
-    keyboard = build_action_keyboard(info)
+    user_state[chat_id] = {
+        "reference": clean_title,
+        "version": current_version
+    }
+
+    response_text = f"📖 *{clean_title} ({current_version})*\n\n{passage_text}"
+    markup = build_passage_keyboard(current_version)
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=status_msg.message_id,
+        text=response_text,
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+# ==========================================
+# 7. CALLBACK QUERY HANDLERS (BUTTON CLICKS)
+# ==========================================
+@bot.callback_query_handler(func=lambda call: call.data in ["search_next", "search_prev"])
+def handle_search_pagination(call):
+    chat_id = call.message.chat.id
+
+    if chat_id not in user_search_results:
+        bot.answer_callback_query(call.id, "Search session expired. Please run /search again.")
+        return
+
+    if call.data == "search_next":
+        user_search_results[chat_id]["page"] += 1
+    elif call.data == "search_prev":
+        user_search_results[chat_id]["page"] = max(0, user_search_results[chat_id]["page"] - 1)
+
+    send_search_page(chat_id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("ver_", "nav_")))
+def handle_passage_buttons(call):
+    chat_id = call.message.chat.id
+    state = user_state.get(chat_id)
+
+    if not state:
+        bot.answer_callback_query(call.id, "Session expired. Please type a Bible verse again.")
+        return
+
+    reference = state["reference"]
+    version = state["version"]
+
+    if call.data.startswith("ver_"):
+        version = call.data.split("_")[1]
+    elif call.data == "nav_prev":
+        reference = adjust_chapter(reference, -1)
+    elif call.data == "nav_next":
+        reference = adjust_chapter(reference, 1)
+
+    bot.answer_callback_query(call.id, f"Loading {reference} ({version})...")
+
+    clean_title, passage_text = fetch_passage(reference, version)
+    if not passage_text:
+        bot.answer_callback_query(call.id, "Could not load that chapter or translation.")
+        return
+
+    user_state[chat_id] = {
+        "reference": clean_title,
+        "version": version
+    }
+
+    response_text = f"📖 *{clean_title} ({version})*\n\n{passage_text}"
+    markup = build_passage_keyboard(version)
+
     try:
-        await query.edit_message_text(
-            text=info["text"], parse_mode="Markdown", reply_markup=keyboard
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=response_text,
+            reply_markup=markup,
+            parse_mode="Markdown"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Edit Message Notice: {e}")
 
-
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_query = update.inline_query.query.strip()
-    if not raw_query:
-        return
-
-    user_id = update.inline_query.from_user.id
-    default_trans = user_translations.get(user_id, "NIV")
-
-    words = raw_query.split()
-    if len(words) > 1 and words[-1].upper() in TRANSLATIONS:
-        translation = words[-1].upper()
-        query_str = " ".join(words[:-1])
-    else:
-        translation = default_trans
-        query_str = raw_query
-
-    info = fetch_passage_data(query_str, translation)
-    if not info:
-        return
-
-    clean_preview = info["text"].split("\n\n", 1)[-1][:95]
-    results = [
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title=f"📖 {info['reference']} ({info['translation']})",
-            description=clean_preview,
-            input_message_content=InputTextMessageContent(info["text"], parse_mode="Markdown"),
-            reply_markup=build_action_keyboard(info),
-        )
-    ]
-    await update.inline_query.answer(results, cache_time=60)
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bible Bot is alive!")
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+# ==========================================
+# 8. START BOT & SERVER
+# ==========================================
 if __name__ == "__main__":
-    print("Multi-Version Bible Bot (with TPT, MSG, AMP) is running! Press Ctrl+C to stop.")
-    threading.Thread(target=start_health_server, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("get", handle_verse_request))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_verse_request))
-    app.add_handler(CallbackQueryHandler(handle_button_click))
-    app.add_handler(InlineQueryHandler(inline_query))
-    app.run_polling()
+    print("Starting Render Keep-Alive Web Server...")
+    keep_alive()
+    print("Bible Bot is polling...")
+    bot.infinity_polling(skip_pending=True)
