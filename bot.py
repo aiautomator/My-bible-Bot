@@ -8,12 +8,22 @@ from bs4 import BeautifulSoup
 from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from dotenv import load_dotenv
+
+# Load variables from the .env file into the environment
+load_dotenv()
+
+
 
 # ==========================================
 # 1. CONFIGURATION & INITIALIZATION
 # ==========================================
-# Replace with your actual BotFather token or set it in Render Environment Variables
-BOT_TOKEN  = "8825313159:AAFfZDCqJ79dyEg9dhok8c5s-WuJIHARUKc"
+# Replace with your ac# Fetch the variable using the exact key you set in Render
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# Fail fast if the token is missing so your bot doesn't crash silently later
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is missing from the environment variables!")
 bot = telebot.TeleBot(BOT_TOKEN)
 
 SUPPORTED_VERSIONS = ["KJV", "NKJV", "NIV", "NLT", "ESV", "AMP", "MSG", "TPT"]
